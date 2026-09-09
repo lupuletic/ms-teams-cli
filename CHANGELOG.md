@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `TEAMS_CLI_TOKEN_STORE=file` keeps tokens in files under the config directory's `tokens/` instead of the OS keyring — one file per entry, the directory `0700` and each file `0600` on Unix, written through a temporary file and renamed so a reader never sees a partial token. It exists for a process that cannot answer a keychain dialog or has no keyring: a daemon, a server, a container. On macOS the keychain grants access to a code signature, so an unattended process running a freshly built binary is asked once per profile per build; signing the build with a local identity does not end that, because the keychain item's partition list names build hashes (measured 2026-09-09, three dialogs in one day for one daemon); and on Linux without a Secret Service the keyring cannot store a token at all. The keyring stays the default and the two stores are independent. `list_profiles` and the profile index now go through the same store abstraction as the token, so `auth list` works under either.
+
 ## v0.7.0 - 2026-09-06
 
 ### Added
