@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `teams chat list --order-by activity` lists the chats with the newest message first and includes that message's preview on each row (`lastMessagePreview`: id, `createdDateTime`, `messageType`, `body`, `from`), so a caller watching many chats can tell from one page which of them have something new instead of reading every chat in turn. The default listing gives no such signal: Graph's order is not by activity, and `lastUpdatedDateTime` moves on renames and membership changes rather than messages — a chat last "updated" in June carried a message from the same morning (observed 2026-09-08), and a poller keyed on it read a tag nine minutes late. Graph orders `/me/chats` by `lastMessagePreview/createdDateTime` only, descending only, and returns the preview only when it is expanded, so the one flag sets both `$expand` and `$orderby`. The human table shows the newest message's time and sender in place of the update time; JSON carries the preview object and omits it entirely from a plain listing.
+
 ## v0.7.0 - 2026-09-06
 
 ### Added

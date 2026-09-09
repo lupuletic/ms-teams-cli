@@ -27,6 +27,17 @@ fn teams() -> Command {
     Command::from_std(teams_process())
 }
 
+/// `--order-by` is checked by a clap `value_parser`, so a wrong value fails at parse time,
+/// before a token is resolved; the message has to name the value that exists.
+#[test]
+fn chat_list_rejects_an_unknown_order_before_it_needs_credentials() {
+    teams()
+        .args(["chat", "list", "--order-by", "updated"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("activity"));
+}
+
 /// The expiration check is a clap `value_parser`, so it has to reject the value before anything
 /// resolves a token or opens a connection. Testing the parser alone would not notice the
 /// attribute being dropped.

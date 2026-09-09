@@ -58,6 +58,13 @@ pub struct ChatMessageFrom {
     pub user: Option<ChatMessageUser>,
 }
 
+impl ChatMessageFrom {
+    /// The sending user's display name, when the identity carries one.
+    pub fn display_name(&self) -> Option<&str> {
+        self.user.as_ref()?.display_name.as_deref()
+    }
+}
+
 /// User identity within a message. `user_identity_type` is Graph's
 /// `userIdentityType` (for example `aadUser`); it appears on mention
 /// identities and is retained so read-backs keep the full identity shape.
