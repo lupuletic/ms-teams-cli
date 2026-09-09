@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 use super::token::TokenInfo;
@@ -5,6 +7,7 @@ use crate::error::{Result, TeamsError};
 
 const SERVICE_NAME: &str = "teams-cli";
 const DISABLE_KEYRING_ENV: &str = "TEAMS_CLI_DISABLE_KEYRING";
+const TOKEN_STORE_ENV: &str = "TEAMS_CLI_TOKEN_STORE";
 
 /// Largest secret a single OS credential entry will hold, when the platform
 /// imposes a limit small enough to matter.
@@ -44,6 +47,49 @@ fn disabled() -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+/// Where tokens live. The OS keyring by default; files under the config
+/// directory when `TEAMS_CLI_TOKEN_STORE=file`, for a process that cannot
+/// answer a keychain dialog or has no keyring at all — a daemon, a server, a
+/// container. On macOS the keychain grants access to a code signature, so an
+/// unattended process running a freshly built binary is asked once per
+/// profile per build, and a build signed with a local identity is still asked
+/// because the item's partition list names build hashes (measured
+/// 2026-09-09); Linux without a Secret Service cannot store a token at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreKind {
+    Keyring,
+    File,
+}
+
+fn store_kind() -> Result<StoreKind> {
+    let Ok(value) = std::env::var(TOKEN_STORE_ENV) else {
+        return Ok(StoreKind::Keyring);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "keyring" | "keychain" => Ok(StoreKind::Keyring),
+        "file" => Ok(StoreKind::File),
+        other => Err(TeamsError::InvalidInput(format!(
+            "{TOKEN_STORE_ENV}={other} is not a token store; use `keyring` (default) or `file`"
+        ))),
+    }
+}
+
+fn store() -> Result<Box<dyn SecretStore>> {
+    Ok(match store_kind()? {
+        StoreKind::Keyring => Box::new(OsKeyring),
+        StoreKind::File => Box::new(FileStore::new(crate::config::config_dir()?.join("tokens"))),
+    })
+}
+
+/// A file store has no size limit, so it never chunks; the keyring chunks
+/// where the platform makes it necessary.
+fn chunk_bytes_for(kind: StoreKind) -> Option<usize> {
+    match kind {
+        StoreKind::Keyring => CHUNK_BYTES,
+        StoreKind::File => None,
+    }
 }
 
 /// The minimal credential-store surface the token logic needs. Implemented by
@@ -106,25 +152,139 @@ impl SecretStore for OsKeyring {
     }
 }
 
+/// One file per entry under `dir`, `<key>` with `:` as `.` (`default:token` is
+/// `default.token`), the directory `0700` and each file `0600` on Unix. Writes
+/// go to a sibling temporary file and rename over, so a reader never sees a
+/// partial token.
+struct FileStore {
+    dir: PathBuf,
+}
+
+impl FileStore {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn path(&self, key: &str) -> PathBuf {
+        self.dir.join(key.replace([':', '/', '\\'], "."))
+    }
+
+    fn ensure_dir(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| {
+            TeamsError::KeyringError(format!(
+                "Failed to create token directory {}: {e}",
+                self.dir.display()
+            ))
+        })?;
+        restrict(&self.dir, 0o700)
+    }
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+        TeamsError::KeyringError(format!(
+            "Failed to set permissions on {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+/// Create `path` and write `value`, never following a symlink and never
+/// widening past `0600`: `create_new` fails rather than opening an existing
+/// file or a planted symlink, and the mode is set at creation so the bytes are
+/// never briefly readable at the umask default.
+fn write_private(path: &Path, value: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| TeamsError::KeyringError(format!("Failed to store token: {e}")))?;
+    file.write_all(value)
+        .map_err(|e| TeamsError::KeyringError(format!("Failed to store token: {e}")))
+}
+
+fn absent_file_as_none<T>(result: std::io::Result<T>, what: &str) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(TeamsError::KeyringError(format!("Failed to {what}: {e}"))),
+    }
+}
+
+impl SecretStore for FileStore {
+    fn get_password(&self, key: &str) -> Result<Option<String>> {
+        absent_file_as_none(std::fs::read_to_string(self.path(key)), "retrieve token")
+    }
+
+    fn set_password(&self, key: &str, value: &str) -> Result<()> {
+        self.set_secret(key, value.as_bytes())
+    }
+
+    fn get_secret(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        absent_file_as_none(std::fs::read(self.path(key)), "retrieve token")
+    }
+
+    fn set_secret(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.ensure_dir()?;
+        let path = self.path(key);
+        // A temp name unique to this write (pid + nanos) so concurrent writers
+        // never share one, written 0600 and renamed over so a reader never sees
+        // a partial or wider-than-0600 token.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("token");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = self.dir.join(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
+        write_private(&tmp, value)?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(TeamsError::KeyringError(format!("Failed to store token: {e}")));
+        }
+        Ok(())
+    }
+
+    fn delete(&self, key: &str) -> Result<bool> {
+        Ok(absent_file_as_none(std::fs::remove_file(self.path(key)), "delete token")?.is_some())
+    }
+}
+
 pub fn store_token(profile: &str, token: &TokenInfo) -> Result<()> {
     if disabled() {
         return Err(TeamsError::KeyringError("Keyring is disabled".into()));
     }
-    store_token_in(&OsKeyring, profile, token, CHUNK_BYTES)
+    store_token_in(&*store()?, profile, token, chunk_bytes_for(store_kind()?))
 }
 
 pub fn get_token(profile: &str) -> Result<TokenInfo> {
     if disabled() {
         return Err(TeamsError::KeyringError("Keyring is disabled".into()));
     }
-    get_token_from(&OsKeyring, profile)
+    get_token_from(&*store()?, profile)
 }
 
 pub fn delete_token(profile: &str) -> Result<()> {
     if disabled() {
         return Ok(());
     }
-    delete_token_from(&OsKeyring, profile, CHUNK_BYTES.is_some())
+    delete_token_from(
+        &*store()?,
+        profile,
+        chunk_bytes_for(store_kind()?).is_some(),
+    )
 }
 
 fn store_token_in(
@@ -243,13 +403,9 @@ pub fn list_profiles() -> Vec<String> {
 
     // Keyring doesn't support enumeration natively.
     // We maintain a separate index entry.
-    let entry = match ::keyring::Entry::new(SERVICE_NAME, "profile-index") {
-        Ok(e) => e,
-        Err(_) => return vec![],
-    };
-    match entry.get_password() {
-        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-        Err(_) => vec![],
+    match store().and_then(|s| s.get_password("profile-index")) {
+        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+        _ => vec![],
     }
 }
 
@@ -278,12 +434,9 @@ pub fn remove_profile_from_index(profile: &str) -> Result<()> {
 fn write_profile_index(profiles: &[String]) -> Result<()> {
     let json = serde_json::to_string(profiles)
         .map_err(|e| TeamsError::KeyringError(format!("Failed to serialize index: {e}")))?;
-    let entry = ::keyring::Entry::new(SERVICE_NAME, "profile-index")
-        .map_err(|e| TeamsError::KeyringError(format!("Failed to create keyring entry: {e}")))?;
-    entry
-        .set_password(&json)
-        .map_err(|e| TeamsError::KeyringError(format!("Failed to store index: {e}")))?;
-    Ok(())
+    store()?
+        .set_password("profile-index", &json)
+        .map_err(|e| TeamsError::KeyringError(format!("Failed to store index: {e}")))
 }
 
 #[cfg(test)]
@@ -385,6 +538,52 @@ mod tests {
 
     fn serialized_len(token: &TokenInfo) -> usize {
         serde_json::to_string(token).unwrap().len()
+    }
+
+    #[test]
+    fn file_store_round_trips_under_the_directory_with_private_permissions() {
+        let dir = std::env::temp_dir().join(format!("teams-cli-tokens-{}", uuid::Uuid::new_v4()));
+        let store = FileStore::new(dir.clone());
+        let original = token(&"a".repeat(5000));
+
+        store_token_in(&store, "work", &original, chunk_bytes_for(StoreKind::File)).unwrap();
+
+        let path = dir.join("work.token");
+        assert!(path.is_file(), "{}", path.display());
+        let leftover_tmp = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "temporary file left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let loaded = get_token_from(&store, "work").unwrap();
+        assert_eq!(loaded.access_token, original.access_token);
+        assert_eq!(loaded.refresh_token, original.refresh_token);
+
+        store.set_password("profile-index", "[\"work\"]").unwrap();
+        assert_eq!(
+            store.get_password("profile-index").unwrap().as_deref(),
+            Some("[\"work\"]")
+        );
+
+        delete_token_from(&store, "work", false).unwrap();
+        assert!(get_token_from(&store, "work").is_err());
+        assert!(
+            !store.delete("work:token").unwrap(),
+            "a second delete finds nothing"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
