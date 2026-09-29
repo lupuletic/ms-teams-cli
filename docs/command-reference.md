@@ -179,7 +179,7 @@ teams chat members add CHAT_ID --user-id USER_ID [--role member|owner]
 teams chat members remove CHAT_ID MEMBER_ID
 ```
 
-`chat list --order-by activity` lists the chats with the newest message first and includes that message's preview on each row as `lastMessagePreview` (id, `createdDateTime`, `messageType`, `body`, `from`), so one page says which chats have something new. The default listing carries no such signal: Graph's order is not by activity, and `lastUpdatedDateTime` moves on renames and membership changes rather than messages. Graph orders `/me/chats` by `lastMessagePreview/createdDateTime` only, descending only, and returns the preview only when it is expanded, which is why the one flag does both.
+`chat list --order-by activity` lists the chats with the newest message first and includes that message's preview on each row as `lastMessagePreview` (id, `createdDateTime`, `messageType`, `isDeleted`, `body`, `from`, and `eventDetail` when the newest message is a system event), so one page says which chats have something new. The default listing carries no such signal: Graph's order is not by activity, and `lastUpdatedDateTime` moves on renames and membership changes rather than messages. Graph orders `/me/chats` by `lastMessagePreview/createdDateTime` only, descending only, and returns the preview only when it is expanded, which is why the one flag does both.
 
 When creating a chat, members default to the `owner` role. Azure AD guest users must be marked with a `:guest` suffix (e.g. `--members <your-id>,<guest-id>:guest`) or Microsoft Graph rejects the request.
 

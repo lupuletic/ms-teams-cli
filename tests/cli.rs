@@ -27,7 +27,7 @@ fn teams() -> Command {
     Command::from_std(teams_process())
 }
 
-/// `--order-by` is checked by a clap `value_parser`, so a wrong value fails at parse time,
+/// `--order-by` is a clap value enum, so a wrong value fails at parse time,
 /// before a token is resolved; the message has to name the value that exists.
 #[test]
 fn chat_list_rejects_an_unknown_order_before_it_needs_credentials() {
@@ -36,6 +36,21 @@ fn chat_list_rejects_an_unknown_order_before_it_needs_credentials() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("activity"));
+}
+
+/// The accepted orders are listed in `--help` (and so in shell completions).
+#[test]
+fn chat_list_help_lists_the_orders() {
+    teams()
+        .args(["chat", "list", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--order-by <ORDER_BY>").and(
+                predicate::str::contains("activity")
+                    .and(predicate::str::contains("Newest message first")),
+            ),
+        );
 }
 
 /// The expiration check is a clap `value_parser`, so it has to reject the value before anything

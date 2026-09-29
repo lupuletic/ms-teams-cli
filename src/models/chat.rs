@@ -35,6 +35,11 @@ pub struct ChatMessageInfo {
     pub body: Option<ItemBody>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<ChatMessageFrom>,
+    /// What happened, when the newest message is a `systemEventMessage` (a
+    /// member added, the chat renamed). Graph's `eventMessageDetail` is a
+    /// family of `@odata.type`d shapes, so it is passed through as returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_detail: Option<serde_json::Value>,
 }
 
 /// Request body for creating a new chat.
@@ -116,5 +121,39 @@ mod tests {
             .and_then(|f| f.user)
             .and_then(|u| u.display_name);
         assert_eq!(from.as_deref(), Some("Catalin Lupuleti"));
+    }
+
+    /// When the newest message is a system event, the preview carries its
+    /// `eventDetail`; it is passed through, and a `null` one stays omitted.
+    #[test]
+    fn chat_preview_keeps_a_system_event_detail() {
+        let detail = serde_json::json!({
+            "@odata.type": "#microsoft.graph.membersAddedEventMessageDetail",
+            "members": [{"id": "u-2", "displayName": null}],
+            "initiator": {"user": {"id": "u-1", "displayName": null}}
+        });
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "19:abc@thread.v2",
+            "lastMessagePreview": {
+                "id": "1788942159891",
+                "messageType": "systemEventMessage",
+                "from": null,
+                "eventDetail": detail
+            }
+        }))
+        .unwrap();
+        let out = serde_json::to_value(&chat).unwrap();
+        assert_eq!(out["lastMessagePreview"]["eventDetail"], detail);
+
+        let plain: Chat = serde_json::from_value(serde_json::json!({
+            "id": "19:abc@thread.v2",
+            "lastMessagePreview": {"id": "1", "messageType": "message", "eventDetail": null}
+        }))
+        .unwrap();
+        let out = serde_json::to_value(&plain).unwrap();
+        assert!(
+            out["lastMessagePreview"].get("eventDetail").is_none(),
+            "{out}"
+        );
     }
 }

@@ -15,9 +15,9 @@ use crate::output::{self, OutputFormat};
 pub enum ChatCommand {
     /// List your chats
     List {
-        /// `activity`: newest message first, with each chat's `lastMessagePreview`
-        #[arg(long, value_parser = parse_order)]
-        order_by: Option<ChatOrder>,
+        /// Order the chats; without it Graph's default order applies
+        #[arg(long, value_enum)]
+        order_by: Option<ChatOrderBy>,
     },
     /// Get a chat by ID
     Get {
@@ -108,7 +108,7 @@ pub async fn run(
     match cmd {
         ChatCommand::List { order_by } => {
             let start = Instant::now();
-            let order = order_by.unwrap_or_default();
+            let order = order_by.map_or(ChatOrder::Default, ChatOrder::from);
             let chats = api::chats::list_chats(&client, order, pagination).await?;
             if format == OutputFormat::Human {
                 let headers = match order {
@@ -181,12 +181,21 @@ pub async fn run(
     }
 }
 
-fn parse_order(raw: &str) -> std::result::Result<ChatOrder, String> {
-    match raw.trim() {
-        "activity" => Ok(ChatOrder::Activity),
-        other => Err(format!(
-            "`{other}` is not an order; `chat list --order-by` accepts activity"
-        )),
+/// The orders `chat list --order-by` offers. Graph sorts `/me/chats` one way
+/// only, by its newest message, so there is a single value; an enum leaves
+/// room for another if Graph adds one, and lets clap list it in `--help` and
+/// shell completions.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ChatOrderBy {
+    /// Newest message first, with each chat's `lastMessagePreview`
+    Activity,
+}
+
+impl From<ChatOrderBy> for ChatOrder {
+    fn from(order: ChatOrderBy) -> Self {
+        match order {
+            ChatOrderBy::Activity => ChatOrder::Activity,
+        }
     }
 }
 
@@ -306,13 +315,6 @@ mod tests {
         assert_eq!(&row[3..], ["2026-09-09T08:22:39Z", "Catalin Lupuleti"]);
         let row = chat_list_row(&chat, ChatOrder::Default);
         assert_eq!(&row[3..], ["2026-06-10T12:42:02Z"]);
-    }
-
-    #[test]
-    fn order_parser_accepts_activity_and_names_it_on_a_miss() {
-        assert!(matches!(parse_order("activity"), Ok(ChatOrder::Activity)));
-        let err = parse_order("updated").unwrap_err();
-        assert!(err.contains("activity"));
     }
 
     #[test]
