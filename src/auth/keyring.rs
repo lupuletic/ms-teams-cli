@@ -64,16 +64,27 @@ enum StoreKind {
 }
 
 fn store_kind() -> Result<StoreKind> {
-    let Ok(value) = std::env::var(TOKEN_STORE_ENV) else {
+    parse_store_kind(std::env::var(TOKEN_STORE_ENV).ok().as_deref())
+}
+
+fn parse_store_kind(value: Option<&str>) -> Result<StoreKind> {
+    let Some(value) = value else {
         return Ok(StoreKind::Keyring);
     };
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "keyring" | "keychain" => Ok(StoreKind::Keyring),
         "file" => Ok(StoreKind::File),
-        other => Err(TeamsError::InvalidInput(format!(
-            "{TOKEN_STORE_ENV}={other} is not a token store; use `keyring` (default) or `file`"
+        _ => Err(TeamsError::InvalidInput(format!(
+            "{TOKEN_STORE_ENV}={value} is not a token store; use `keyring` (default) or `file`"
         ))),
     }
+}
+
+/// Refuse a mistyped `TEAMS_CLI_TOKEN_STORE` before any command runs. Token
+/// reads report every store error as "not signed in", so without this a typo
+/// would send the caller to log in again instead of naming the variable.
+pub fn check_token_store() -> Result<()> {
+    store_kind().map(|_| ())
 }
 
 fn store() -> Result<Box<dyn SecretStore>> {
@@ -212,9 +223,43 @@ fn write_private(path: &Path, value: &[u8]) -> Result<()> {
     let mut file = options
         .open(path)
         .map_err(|e| TeamsError::KeyringError(format!("Failed to store token: {e}")))?;
+    // Flushed to disk before the caller renames it into place, so a crash
+    // cannot leave an empty or truncated token where the old one was.
     file.write_all(value)
+        .and_then(|()| file.sync_all())
         .map_err(|e| TeamsError::KeyringError(format!("Failed to store token: {e}")))
 }
+
+/// Make the rename itself durable. Best-effort: the token is already in
+/// place, and Windows cannot open a directory to sync it.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// The store writes every file `0600`, so a token readable by the group or by
+/// others was copied or loosened by hand. Say so on stderr rather than refuse:
+/// a refused read would surface as "not signed in", which hides the cause.
+#[cfg(unix)]
+fn warn_if_exposed(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                "{} is readable by other users (mode {mode:o}); run `chmod 600` on it",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_exposed(_path: &Path) {}
 
 fn absent_file_as_none<T>(result: std::io::Result<T>, what: &str) -> Result<Option<T>> {
     match result {
@@ -226,7 +271,9 @@ fn absent_file_as_none<T>(result: std::io::Result<T>, what: &str) -> Result<Opti
 
 impl SecretStore for FileStore {
     fn get_password(&self, key: &str) -> Result<Option<String>> {
-        absent_file_as_none(std::fs::read_to_string(self.path(key)), "retrieve token")
+        let path = self.path(key);
+        warn_if_exposed(&path);
+        absent_file_as_none(std::fs::read_to_string(path), "retrieve token")
     }
 
     fn set_password(&self, key: &str, value: &str) -> Result<()> {
@@ -234,7 +281,9 @@ impl SecretStore for FileStore {
     }
 
     fn get_secret(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        absent_file_as_none(std::fs::read(self.path(key)), "retrieve token")
+        let path = self.path(key);
+        warn_if_exposed(&path);
+        absent_file_as_none(std::fs::read(path), "retrieve token")
     }
 
     fn set_secret(&self, key: &str, value: &[u8]) -> Result<()> {
@@ -248,12 +297,17 @@ impl SecretStore for FileStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let tmp = self.dir.join(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
+        let tmp = self
+            .dir
+            .join(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
         write_private(&tmp, value)?;
         if let Err(e) = std::fs::rename(&tmp, &path) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(TeamsError::KeyringError(format!("Failed to store token: {e}")));
+            return Err(TeamsError::KeyringError(format!(
+                "Failed to store token: {e}"
+            )));
         }
+        sync_dir(&self.dir);
         Ok(())
     }
 
@@ -584,6 +638,37 @@ mod tests {
             "a second delete finds nothing"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_kind_is_keyring_unless_file_is_asked_for() {
+        for value in [
+            None,
+            Some(""),
+            Some("keyring"),
+            Some("Keychain"),
+            Some(" KEYRING "),
+        ] {
+            assert_eq!(
+                parse_store_kind(value).unwrap(),
+                StoreKind::Keyring,
+                "{value:?}"
+            );
+        }
+        for value in ["file", "FILE", " file\n"] {
+            assert_eq!(
+                parse_store_kind(Some(value)).unwrap(),
+                StoreKind::File,
+                "{value:?}"
+            );
+        }
+        let err = parse_store_kind(Some("flie")).unwrap_err();
+        assert!(matches!(err, TeamsError::InvalidInput(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("TEAMS_CLI_TOKEN_STORE=flie"),
+            "{err}"
+        );
     }
 
     #[test]
